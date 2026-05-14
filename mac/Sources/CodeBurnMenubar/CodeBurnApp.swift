@@ -259,10 +259,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @discardableResult
     private func clearStaleForceRefreshIfNeeded(now: Date = Date()) -> Bool {
-        if let started = forceRefreshStartedAt, forceRefreshTask != nil {
+        if forceRefreshTask != nil {
+            guard let started = forceRefreshStartedAt else {
+                NSLog("CodeBurn: force refresh task had no start timestamp - clearing")
+                forceRefreshTask?.cancel()
+                forceRefreshTask = nil
+                forceRefreshGeneration &+= 1
+                store.resetLoadingState()
+                return true
+            }
             let elapsed = now.timeIntervalSince(started)
             guard elapsed > forceRefreshWatchdogSeconds else { return false }
-            NSLog("CodeBurn: force refresh stuck for %ds — cancelling and restarting", Int(elapsed))
+            NSLog("CodeBurn: force refresh stuck for %ds - cancelling and restarting", Int(elapsed))
             forceRefreshTask?.cancel()
             forceRefreshTask = nil
             forceRefreshStartedAt = nil

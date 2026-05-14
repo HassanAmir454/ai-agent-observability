@@ -100,8 +100,12 @@ final class AppStore {
         staleInteractivePayloadAgeSeconds != nil
     }
 
+    var hasMissingInteractivePayloadWithoutAttempt: Bool {
+        cache[currentKey] == nil && !isCurrentKeyLoading && !hasAttemptedCurrentKeyLoad
+    }
+
     var shouldResetInteractiveRefreshPipeline: Bool {
-        hasStaleLoading || hasStaleInteractivePayload
+        hasStaleLoading || hasStaleInteractivePayload || hasMissingInteractivePayloadWithoutAttempt
     }
 
     var staleInteractivePayloadAgeSeconds: Int? {
@@ -149,16 +153,7 @@ final class AppStore {
     /// all-provider data in parallel so tab strip costs stay in sync with the hero.
     func switchTo(period: Period) {
         selectedPeriod = period
-        switchTask?.cancel()
-        switchTask = Task {
-            if selectedProvider == .all {
-                await refresh(includeOptimize: false, force: true)
-            } else {
-                async let main: Void = refresh(includeOptimize: false, force: true)
-                async let all: Void = refreshQuietly(period: period)
-                _ = await (main, all)
-            }
-        }
+        startInteractiveSelectionRefresh()
     }
 
     /// Switch to a provider filter. Cancels any in-flight switch so rapid tab tapping only
@@ -166,13 +161,21 @@ final class AppStore {
     /// in parallel so the tab strip costs stay in sync with the hero.
     func switchTo(provider: ProviderFilter) {
         selectedProvider = provider
+        startInteractiveSelectionRefresh()
+    }
+
+    private func startInteractiveSelectionRefresh() {
         switchTask?.cancel()
+        resetLoadingState()
+        let period = selectedPeriod
+        let provider = selectedProvider
+        lastErrorByKey[PayloadCacheKey(period: period, provider: provider)] = nil
         switchTask = Task {
             if provider == .all {
-                await refresh(includeOptimize: false, force: true)
+                await refresh(includeOptimize: false, force: true, showLoading: true)
             } else {
-                async let main: Void = refresh(includeOptimize: false, force: true)
-                async let all: Void = refreshQuietly(period: selectedPeriod)
+                async let main: Void = refresh(includeOptimize: false, force: true, showLoading: true)
+                async let all: Void = refreshQuietly(period: period)
                 _ = await (main, all)
             }
         }

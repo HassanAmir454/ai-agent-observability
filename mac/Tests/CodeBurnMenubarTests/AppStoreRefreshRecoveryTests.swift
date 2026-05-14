@@ -60,4 +60,15 @@ struct AppStoreRefreshRecoveryTests {
         #expect(!store.hasStaleInteractivePayload)
         #expect(!store.shouldResetInteractiveRefreshPipeline)
     }
+
+    @Test("missing unattempted payload triggers hard recovery")
+    func missingUnattemptedPayloadTriggersHardRecovery() {
+        let store = AppStore()
+
+        #expect(!store.hasCachedData)
+        #expect(!store.hasAttemptedCurrentKeyLoad)
+        #expect(store.needsInteractivePayloadRefresh)
+        #expect(store.hasMissingInteractivePayloadWithoutAttempt)
+        #expect(store.shouldResetInteractiveRefreshPipeline)
+    }
 }
