@@ -16,7 +16,7 @@
   compacted immediately after JSON.parse, keeping only the fields needed for
   cost/token aggregation. This is a mitigation - very heavy users may still
   need the streaming parser refactor planned next.
-- **Eager daily-cache hydration caused OOM on most CLI commands.** Nine
+- **Eager daily-cache hydration caused OOM on most CLI commands.** Eight
   commands (report, today, month, export, optimize, compare, models, yield)
   called `hydrateCache()` which parses a 365-day backfill, even though only
   `status --format menubar-json` consumes the daily cache. Removed from all
@@ -35,10 +35,26 @@
 - **Mangled project names in dashboard.** The By Project and Top Sessions
   panels decoded slugs by splitting on `-`, which broke directory names
   containing dashes or dots (e.g. `my-project` rendered as `my/project`).
-  Now uses the real project path instead. Closes #196.
+  Now uses the real project path instead. Closes #320.
 - **Cursor undated bubble rows misattributed to Today.** Bubble rows without
   a `createdAt` timestamp were defaulting to the current date, inflating
   Today's spend. Now skipped at both the SQL and application level.
+- **Node version guard.** Running on Node < 22.13.0 now prints a clear
+  upgrade message instead of crashing with a cryptic `node:sqlite` parse
+  error. Closes #319.
+
+### Fixed (macOS menubar)
+- **All-provider refresh OOM.** Refreshing with provider set to "All" could
+  exhaust the V8 heap on accounts with heavy session history.
+- **Tab refresh recovery.** Switching tabs during a refresh no longer leaves
+  the panel in a stale loading state.
+- **Stale cache recovery.** The menubar now detects and discards a corrupt or
+  outdated on-disk cache instead of rendering zeroes until the next restart.
+- **Refresh timer hardening.** The 30-second auto-refresh timer is now
+  cancelled on sleep/wake and restarted cleanly, preventing overlapping
+  refreshes after lid-open.
+- **Version display.** The settings panel now shows the version without the
+  `v` prefix for consistency with `codeburn --version`.
 
 ## 0.9.8 - 2026-05-10
 
