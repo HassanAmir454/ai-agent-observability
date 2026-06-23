@@ -109,7 +109,8 @@ I used AI as a partner, not an autopilot:
 
 ## Known Limitations
 
-1. **Windows first** — collector paths tested on Windows; macOS auto-detected by CodeBurn but not re-checked here.
+1. **Collector runs on the host, not in Docker** — CodeBurn needs direct access to `~/.claude/`, `~/.cursor/`, and similar directories on the developer's machine. A container cannot see these without fragile, OS-specific host-path volume mounts, so the collector is intentionally run with `npm run collect` on the host, pointed at the dockerized API.
+2. **Windows first** — collector paths tested on Windows; macOS auto-detected by CodeBurn but not re-checked here.
 2. **No backfill** — only sessions from install onward are captured.
 3. **Polling lag** — data is up to ~60s old (accepted).
 4. **Single machine** — no team aggregation yet.
