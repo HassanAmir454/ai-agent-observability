@@ -46,3 +46,7 @@ appstore/
 
 # WIP / not ready
 src/summit.ts
+
+# .NET build output
+api/bin/
+api/obj/
