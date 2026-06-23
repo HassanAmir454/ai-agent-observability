@@ -2,13 +2,13 @@ import type { RecentEvent } from '../types.js'
 import './components.css'
 
 const AGENT_BADGE: Record<string, { bg: string; color: string }> = {
-  Cursor:           { bg: '#dbeafe', color: '#1d4ed8' },
-  'Claude Code':    { bg: '#ede9fe', color: '#6d28d9' },
-  'GitHub Copilot': { bg: '#dcfce7', color: '#15803d' },
+  Cursor:           { bg: 'rgba(59,130,246,0.15)',  color: '#3B82F6' },
+  'Claude Code':    { bg: 'rgba(139,92,246,0.15)',  color: '#8B5CF6' },
+  'GitHub Copilot': { bg: 'rgba(16,185,129,0.15)',  color: '#10B981' },
 }
 
 function badgeStyle(agent: string): React.CSSProperties {
-  const s = AGENT_BADGE[agent] ?? { bg: '#f3f4f6', color: '#374151' }
+  const s = AGENT_BADGE[agent] ?? { bg: 'rgba(123,127,158,0.15)', color: '#7B7F9E' }
   return { backgroundColor: s.bg, color: s.color }
 }
 

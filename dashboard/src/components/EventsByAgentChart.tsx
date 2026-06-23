@@ -11,13 +11,13 @@ import type { AgentSummary } from '../types.js'
 import './components.css'
 
 const AGENT_COLORS: Record<string, string> = {
-  Cursor: '#2563eb',
-  'Claude Code': '#7c3aed',
-  'GitHub Copilot': '#16a34a',
+  Cursor: '#3B82F6',
+  'Claude Code': '#8B5CF6',
+  'GitHub Copilot': '#10B981',
 }
 
 function agentColor(name: string): string {
-  return AGENT_COLORS[name] ?? '#9ca3af'
+  return AGENT_COLORS[name] ?? '#7B7F9E'
 }
 
 interface Props {
