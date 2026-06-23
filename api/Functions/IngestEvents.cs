@@ -1,8 +1,11 @@
+using System.IdentityModel.Tokens.Jwt;
+using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
+using Microsoft.IdentityModel.Tokens;
 using ObservabilityApi.Exceptions;
 using ObservabilityApi.Models;
 using ObservabilityApi.Services;
@@ -26,13 +29,9 @@ public class IngestEvents
     public async Task<IActionResult> Run(
         [HttpTrigger(AuthorizationLevel.Anonymous, "post", Route = "events")] HttpRequest req)
     {
-        var expectedKey = Environment.GetEnvironmentVariable("CollectorApiKey");
-        req.Headers.TryGetValue("X-Api-Key", out var providedKey);
-
-        if (string.IsNullOrEmpty(expectedKey) ||
-            !string.Equals(providedKey.ToString(), expectedKey, StringComparison.Ordinal))
+        if (!TryValidateJwt(req, out var authError))
         {
-            _logger.LogWarning("Rejected /events: missing or invalid X-Api-Key.");
+            _logger.LogWarning("Rejected /events: {Reason}", authError);
             return new UnauthorizedObjectResult(new { error = "Unauthorized" });
         }
 
@@ -99,6 +98,61 @@ public class IngestEvents
             {
                 StatusCode = StatusCodes.Status503ServiceUnavailable
             };
+        }
+    }
+
+    private static bool TryValidateJwt(HttpRequest req, out string reason)
+    {
+        reason = string.Empty;
+
+        if (!req.Headers.TryGetValue("Authorization", out var authHeader))
+        {
+            reason = "Authorization header missing";
+            return false;
+        }
+
+        var headerValue = authHeader.ToString();
+        if (!headerValue.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+            reason = "Authorization header must use Bearer scheme";
+            return false;
+        }
+
+        var tokenString = headerValue["Bearer ".Length..].Trim();
+        if (string.IsNullOrEmpty(tokenString))
+        {
+            reason = "Bearer token is empty";
+            return false;
+        }
+
+        var signingKey = Environment.GetEnvironmentVariable("JwtSigningKey");
+        if (string.IsNullOrEmpty(signingKey))
+        {
+            reason = "JwtSigningKey not configured";
+            return false;
+        }
+
+        var validationParams = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidIssuer = "observability-api",
+            ValidateAudience = true,
+            ValidAudience = "collector",
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(signingKey)),
+            ClockSkew = TimeSpan.FromSeconds(30),
+        };
+
+        try
+        {
+            new JwtSecurityTokenHandler().ValidateToken(tokenString, validationParams, out _);
+            return true;
+        }
+        catch (SecurityTokenException ex)
+        {
+            reason = ex.Message;
+            return false;
         }
     }
 }
