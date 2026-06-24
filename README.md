@@ -143,3 +143,31 @@ Storage uses **Azure SQL Edge** running in Docker. It is a real SQL Server engin
 
 - [SPEC.md](SPEC.md) — full specification and acceptance criteria.
 - [DESIGN.md](DESIGN.md) — design decisions, trade-offs, and rationale.
+
+## Live Demo Commands (in order)
+
+### 1. Confirm the stack is running
+docker compose -f infrastructure/docker-compose.yml up -d --build
+docker compose -f infrastructure/docker-compose.yml ps
+
+### 2. Check API health
+curl http://localhost:7071/api/health
+
+### 3. Open the dashboard in browser
+http://localhost:3000
+
+### 4. Collect real data from the host to local
+$env:INGEST_ENDPOINT="http://localhost:7071"
+$env:COLLECTOR_API_KEY="local-dev-key-change-me"
+npm run collect:once
+
+### 5. Refresh the dashboard, click through 1h / 6h / 24h / 7d
+
+### 6. Show live Azure dashboard
+https://ashy-stone-03ea7b210.7.azurestaticapps.net
+
+### 7. Collect real data from the host to Azure
+
+$env:INGEST_ENDPOINT="https://ai-obs-api-2026v2.azurewebsites.net"
+$env:COLLECTOR_API_KEY="local-dev-key-change-me"
+npm run collect:once

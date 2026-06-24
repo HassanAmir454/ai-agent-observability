@@ -1,134 +1,100 @@
 # Design Decisions
 
-Companion to SPEC.md. Each decision says what I chose, why, and the trade-off.
+Why the system is built this way. SPEC.md says *what* it does; this says *why*.
 
 ---
 
-## How I Used AI on This Assignment
+## How I Used AI
 
-M-Files said the thing that stands out is *how you applied AI and what impact it had*, so I'm honest about it.
+I use AI to speed up the mechanical work and keep the judgement — design, verification, trade-offs — with me.
 
-I used AI as a partner, not an autopilot:
-
-- **Spec first.** I wrote SPEC.md and DESIGN.md before coding, using an AI model to stress-test the acceptance criteria and find edge cases (empty collection, oversized batch, database down).
-- **Grounded in real output.** An early draft assumed a CodeBurn data type. I ran `codeburn export -f json` on my own machine, saw the real shape (a real per-session list plus aggregate arrays), and rewrote the data section to match. This is the difference between AI-assisted and AI-dependent: I verified instead of trusting.
-- **Cursor agent for building, me for reviewing.** I used Cursor's agent (Claude models) to generate boilerplate, then reviewed every file for async usage, dependency injection, parameterised SQL, and error handling.
-- **Impact:** spec-first + AI scaffolding + review let me build a four-layer stack in the assignment window while keeping the spec, code, and behaviour aligned.
+- **Spec before code.** I wrote SPEC.md and DESIGN.md first, using a model to find edge cases (empty collection, oversized batch, database down).
+- **Check against real output.** My first data model assumed a wrong CodeBurn shape. I ran `codeburn report --format json`, saw the real shape, and rewrote the data section. I verify; I don't trust blindly.
+- **Generate, then review.** Cursor's agent scaffolded the repetitive code; I reviewed every file for async usage, dependency injection, parameterised SQL, and error handling. The bugs I found came from that review.
 
 ---
 
-## Decision 1 — Extend CodeBurn, don't replace it
+## Decisions
 
-**Chose:** add new files in a `collector/` folder; touch no existing CodeBurn file.
-**Why:** CodeBurn's parsing is already tested across many tools. Rewriting it would add bugs and waste time. The brief asks to *extend*.
-**Trade-off:** I depend on CodeBurn's output shape; if they change it, my mapper breaks. Fine for this scope.
+**1 — Extend CodeBurn, don't replace it.** New code lives in `collector/`; no CodeBurn file is touched. Its parsing already works across many tools, so rewriting it would only add bugs. *Trade-off:* I depend on its output shape.
 
----
+**2 — Read CodeBurn's CLI output.** I read `codeburn report --format json` instead of importing internal code. The CLI JSON is a stable public contract, so the brief's standalone-collector fallback is a one-file change. *Trade-off:* slightly slower than in-process — negligible at a 60-min interval.
 
-## Decision 2 — Use CodeBurn's CLI output, with a standalone fallback
+**3 — Azure SQL Edge, not a document store.** Every query is relational and aggregate-heavy (events in the last N hours, grouped by agent/activity, recent 20). Indexed SQL does this directly. It's a real SQL Server engine, free, runs in Docker, and matches the Azure SQL I deploy to. *Rejected:* Cosmos (needs partition design), Azurite (no server-side aggregation).
 
-**Chose:** read `codeburn export -f json` from the CLI rather than importing CodeBurn's internal code.
-**Why:** the CLI JSON is a stable public contract. This keeps a clean seam, so the brief's "if CodeBurn blocks you, build a standalone collector" fallback becomes a one-file change.
-**Trade-off:** calling the CLI is slightly slower than in-process calls — negligible at a 60-minute interval.
+**4 — Batch ingestion.** `POST /events` takes an array, since the collector produces all sessions at once — one round-trip, one transaction. The unique constraint makes resends safe, and the repository inserts events one by one so a duplicate never drops new events (this came from a real bug — see end).
 
----
+**5 — Polling, not WebSockets.** The dashboard polls every 60s. Data only changes when the collector runs (every 60 min), so polling keeps the view fresh enough. WebSockets would add complexity for no gain.
 
-## Decision 3 — Azure SQL Edge over Cosmos DB / Azurite
+**6 — JWT bearer-token auth on ingest.** The collector swaps a shared API key for a short-lived token, then sends batches with `Authorization: Bearer`. Any open endpoint that writes to a database is a risk. *Trade-off:* self-issued JWT is simpler but weaker than a managed provider; in production I'd use Entra ID. Full contract below.
 
-**Chose:** Azure SQL Edge (relational).
-**Why:** every query is relational and aggregate-heavy — events in the last N hours, grouped by agent, grouped by activity, recent 20. Indexed SQL does all of this directly.
-**Alternatives:** Cosmos DB would need careful partition design for time-range queries; Azurite Table Storage has no server-side aggregation. Both rejected.
+**7 — Three Docker services.** `database`, `api`, `dashboard`, with the API and dashboard waiting on the database health check. Matches real deployment; one `docker compose up` starts everything in order.
+
+**8 — One event = one session.** A session row from `codeburn export -f json` (real id, timestamp, cost, calls), enriched with model/activity from the aggregate arrays — the smallest unit with a real id. *Honest limit:* tokens/model/activity are aggregate-level, so per-session values are best-effort; I send `0`/`null` rather than invent data. The unique constraint on `(SessionId, EventTimestamp, AgentName)` stops duplicates double-counting.
+
+**9 — CI per layer.** One GitHub Actions workflow, three path-filtered jobs (api, dashboard, collector), each running only when its files change. An automated build gate is what makes generated code trustworthy.
 
 ---
 
-## Decision 4 — Batch ingestion, not one request per event
+## Authentication
 
-**Chose:** `POST /events` takes an array.
-**Why:** the collector produces all sessions at once. A batch means one connection, one atomic transaction, one response to check.
-**Trade-off:** a failed batch loses that run. The unique constraint plus retry makes resends safe.
-**More time:** add a small local queue for guaranteed delivery.
+A self-issued JWT, in two steps.
 
----
+**1. Get a token** — the collector sends its API key:
+```
+POST /api/auth/token   { "apiKey": "<COLLECTOR_API_KEY>" }
+→ 200 { "token": "<JWT>", "expiresIn": 86400 }
+```
+A wrong/missing key returns `401`.
 
-## Decision 5 — Polling, not WebSockets
+**2. Send events** with the token:
+```
+POST /api/events
+Authorization: Bearer <JWT>
+{ "events": [ ... ], "collectorVersion": "1.0.0" }
+```
 
-**Chose:** the dashboard polls every 60 seconds.
-**Why:** data only changes when the collector runs (every 60 min). Polling is simple and shows fresh data within a minute. WebSockets would add a lot of complexity for no real gain here.
+The token is an HS256 JWT with claims `iss=observability-api`, `aud=collector`, `exp=issue+24h`, `nbf=issue`. The API checks issuer, audience, expiry, and signature on every request, before any database write; failures return `401` and are logged. The collector caches the token and, on a `401`, fetches a fresh one and retries once.
 
----
-
-## Decision 6 — API-key auth on ingest
-
-**Chose:** an `X-Api-Key` header on `POST /events` (the brief lists auth as optional).
-**Why:** any open POST that writes to a database is a risk, even locally. ~30 minutes of work, and it shows security awareness.
-**Trade-off:** API keys are weaker than Azure AD. For production I'd switch to Azure AD tokens.
-
----
-
-## Decision 7 — Three Docker services
-
-**Chose:** `database`, `api`, `dashboard`, each built separately with health-gated startup.
-**Why:** matches how these would deploy in real life and makes local dev easier.
-**Trade-off:** a slightly more complex compose file and a slower first start while the DB health check passes.
+Settings: `CollectorApiKey` (shared secret), `JwtSigningKey` (signing key), `INGEST_ENDPOINT` (API base URL). In production, the signing key would live in a secret store and the token would be replaced by Entra ID.
 
 ---
 
-## Decision 8 — Event = one session
+## API Endpoints
 
-**Chose:** an event is one session row from `export -f json`, enriched with model/activity from the aggregate arrays.
-**Why:** a session is the smallest unit with a real id, timestamp, cost, and call count — perfect for a real "recent events" feed and per-agent totals.
-**Honest limit:** tokens, model, and activity are aggregate-level in CodeBurn, so per-session values are best-effort or `0`/`null`. I verified this against live output instead of claiming fields the tool doesn't emit.
-**Real-data note:** some session ids repeat across projects and a few rows show `unknown` / `transcripts` ids with placeholder timestamps. The database de-duplicates on `(SessionId, EventTimestamp, AgentName)` so these don't double-count.
+| Method | Route | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/api/auth/token` | API key in body | Swap the API key for a bearer token |
+| `POST` | `/api/events` | Bearer token | Store a batch of up to 1000 events in one transaction |
+| `GET` | `/api/events/summary?timeRange=1h\|6h\|24h\|7d` | None | Totals, per-agent/activity breakdowns, hourly timeline, recent events |
+| `GET` | `/api/health` | None | API status and database connectivity |
 
----
-
-## Decision 9 — CI per layer
-
-**Chose:** GitHub Actions workflows for api, dashboard, and collector, each filtered so only the changed layer runs.
-**Why:** generated code is only trustworthy behind an automated build gate, and path filtering keeps runs fast.
-
----
-
-## Decision 10 — Specification-driven, not test-first (no TDD)
-
-**Chose:** spec first as the contract, then implement against it, then add a focused set of tests afterward to confirm behaviour. I do **not** write failing tests first.
-**Why:** in the technical interview the team said they do not practice TDD, even though the job description mentions it. So I followed how they actually work: the spec is the single source of truth and drives the build; tests validate the result, they don't drive it. Traceability (spec → code → check) is kept without the test-first ceremony.
-**Trade-off:** without test-first, I rely more on the spec and on reviewing AI-generated code carefully to catch issues early.
-
----
-
-## What I'd Do With More Time
-
-1. A local queue in the collector for guaranteed delivery on network failure.
-2. A `DeviceId` field so several machines can report to one endpoint (team view).
-3. Cost alerts when a daily threshold is passed.
-4. Azure deployment with Terraform — one command to provision Function + SQL.
-5. Anomaly detection for sessions far above a user's average usage.
+Full contracts and acceptance criteria are in SPEC.md (Section 5).
 
 ---
 
 ## Known Limitations
 
-1. **Collector runs on the host, not in Docker** — CodeBurn needs direct access to `~/.claude/`, `~/.cursor/`, and similar directories on the developer's machine. A container cannot see these without fragile, OS-specific host-path volume mounts, so the collector is intentionally run with `npm run collect` on the host, pointed at the dockerized API.
-2. **Windows first** — collector paths tested on Windows; macOS auto-detected by CodeBurn but not re-checked here.
-2. **No backfill** — only sessions from install onward are captured.
-3. **Polling lag** — data is up to ~60s old (accepted).
-4. **Single machine** — no team aggregation yet.
-5. **No dashboard login** — open on localhost; accepted for local use.
-6. **Aggregate fields** — some per-session values are best-effort because CodeBurn reports them per model/period (Decision 8).
+- **Collector runs on the host, not in Docker** — CodeBurn reads local files (`~/.claude/`, `~/.cursor/`) a container can't see without fragile mounts. A deliberate choice; only this part runs outside Docker.
+- **Aggregate-derived fields** — some values are per model/period, not per session (Decision 8).
+- **Polling latency** — data up to ~60s old; fine since the source changes hourly.
+- **Single machine** — no team aggregation yet.
+- **No dashboard login** — the read-only dashboard is open; the ingest path that writes is protected.
+- **No backfill** — only sessions from install onward.
+
+**With more time:** a local delivery queue, a `DeviceId` field for team view, cost alerts, Terraform for the Azure deploy, and anomaly detection.
 
 ---
 
-## Technology Choices
+## Technology
 
-| Layer | Technology | Reason |
-|---|---|---|
-| Collector | TypeScript + Node 22 | Matches CodeBurn's stack |
-| Scheduling | `setInterval` + env config | Simple, no extra deps |
-| Ingest API | C# Azure Functions v4 (isolated) | Assignment requirement |
-| Data access | EF Core or Dapper | Clean .NET, parameterised SQL |
-| Database | Azure SQL Edge | Relational, indexed, runs in Docker |
-| Dashboard | React 18 + TypeScript + Vite | Type-safe, fast dev server |
-| Charts | Chart.js | Lightweight, no lock-in |
-| CI | GitHub Actions | Native to GitHub, path-filtered |
-| Local env | Docker Compose | One-command startup |
+Collector: TypeScript + Node 22 · API: C# Azure Functions v4 (.NET 8 isolated) · Data: EF Core · DB: Azure SQL Edge · Dashboard: React + TypeScript + Vite · Charts: Recharts · CI: GitHub Actions · Local: Docker Compose · Cloud (bonus): Azure SQL + Functions + Static Web Apps.
+
+---
+
+## Bugs Found During Review
+
+- **Batch insert dropped new events** — the first repository saved the whole batch at once, so one duplicate rolled back the save and silently dropped new events. Fixed by inserting one by one and skipping only true duplicates.
+- **Timestamps collapsed to midnight** — the mapper took `eventTimestamp` from CodeBurn's date (no time of day), so every event landed at midnight and the 1h/6h views were empty. Fixed by using the collection time.
+
+Both were caught by reading the code and testing against the spec, not by the generator.
