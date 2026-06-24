@@ -1,7 +1,6 @@
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using ObservabilityApi.Data;
-using ObservabilityApi.Exceptions;
 using ObservabilityApi.Models;
 
 namespace ObservabilityApi.Services;
@@ -21,19 +20,29 @@ public class EventRepository : IEventRepository
     public async Task<int> SaveBatchAsync(List<AgentEvent> events)
     {
         await using var transaction = await _db.Database.BeginTransactionAsync();
+        var inserted = 0;
+
         try
         {
-            await _db.AgentEvents.AddRangeAsync(events);
-            var stored = await _db.SaveChangesAsync();
+            foreach (var ev in events)
+            {
+                _db.AgentEvents.Add(ev);
+                try
+                {
+                    await _db.SaveChangesAsync();
+                    inserted++;
+                }
+                catch (DbUpdateException ex) when (ex.InnerException is SqlException sql
+                    && (sql.Number == UniqueViolation || sql.Number == DuplicateKey))
+                {
+                    // Duplicate — detach the failed entity so EF doesn't retry it,
+                    // then continue to the next event without rolling back.
+                    _db.Entry(ev).State = EntityState.Detached;
+                }
+            }
+
             await transaction.CommitAsync();
-            return stored;
-        }
-        catch (DbUpdateException ex) when (ex.InnerException is SqlException sql
-            && (sql.Number == UniqueViolation || sql.Number == DuplicateKey))
-        {
-            await transaction.RollbackAsync();
-            throw new DuplicateEventException(
-                "One or more events violate the UQ_AgentEvents unique constraint.", ex);
+            return inserted;
         }
         catch
         {

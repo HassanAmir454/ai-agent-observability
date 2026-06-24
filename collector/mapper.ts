@@ -29,11 +29,6 @@ function dominantActivity(activities: ReportActivity[]): string {
   return LABEL_TO_CATEGORY[top.category] ?? top.category.toLowerCase()
 }
 
-function toIso(date: string | null, fallback: string): string {
-  if (!date) return fallback
-  const parsed = new Date(date)
-  return Number.isNaN(parsed.getTime()) ? fallback : parsed.toISOString()
-}
 
 export function reportMap(reportJson: CodeBurnReport, provider: string): AgentEvent[] {
   const sessions = reportJson.topSessions
@@ -72,7 +67,7 @@ export function reportMap(reportJson: CodeBurnReport, provider: string): AgentEv
       apiCalls: entry.calls,
       hasAgentSpawn: false,
       sessionDurationMinutes: 0,
-      eventTimestamp: toIso(entry.date, collectedAt),
+      eventTimestamp: collectedAt,
       collectedAt,
     }
   })
