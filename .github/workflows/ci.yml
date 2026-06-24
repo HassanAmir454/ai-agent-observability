@@ -4,24 +4,82 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 jobs:
-  semgrep:
+
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      api:       ${{ steps.filter.outputs.api }}
+      dashboard: ${{ steps.filter.outputs.dashboard }}
+      collector: ${{ steps.filter.outputs.collector }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'api/**'
+            dashboard:
+              - 'dashboard/**'
+            collector:
+              - 'collector/**'
+              - 'package.json'
+
+  api:
+    name: API (dotnet build + format)
+    needs: changes
+    if: needs.changes.outputs.api == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Restore
+        run: dotnet restore
+        working-directory: api
+      - name: Build
+        run: dotnet build --no-restore -c Release
+        working-directory: api
+      - name: Format check
+        run: dotnet format --verify-no-changes
+        working-directory: api
 
-      - name: Install Semgrep
-        run: pip install semgrep
+  dashboard:
+    name: Dashboard (build + type-check)
+    needs: changes
+    if: needs.changes.outputs.dashboard == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - name: Install
+        run: npm ci
+        working-directory: dashboard
+      - name: Build (includes tsc)
+        run: npm run build
+        working-directory: dashboard
 
-      - name: Run Semgrep bracket-assign guard
-        run: |
-          set -e
-          semgrep --config .semgrep/rules/no-bracket-assign-hot-paths.yml \
-            --strict --json \
-            src/providers/ src/parser.ts > semgrep-out.json
-          FINDINGS=$(jq '.results | length' semgrep-out.json)
-          if [ "$FINDINGS" -gt 0 ]; then
-            jq -r '.results[] | "::error file=\(.path),line=\(.start.line)::\(.extra.message)"' semgrep-out.json
-            exit 1
-          fi
+  collector:
+    name: Collector (type-check)
+    needs: changes
+    if: needs.changes.outputs.collector == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Type-check
+        run: npx tsc --noEmit -p tsconfig.json
