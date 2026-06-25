@@ -1,7 +1,7 @@
 # AI Agent Observability — Specification
 
-**Status:** Written before any code
-**Version:** 1.1
+**Status:** Written before any implementation
+**Version:** 1.0
 **Last updated:** 2026-06-23
 **Author:** Hassan Amir
 **Assignment:** M-Files — AI Native Engineer (Agentic Development)
@@ -10,129 +10,185 @@
 
 ## 1. What This System Does
 
-Developers use AI coding tools (Claude Code, Cursor, GitHub Copilot) every day, but have little visibility into how they are used — how many tokens, which agent, how much cost, what kind of work.
+Engineering teams use AI coding tools every day — Claude Code, Cursor, GitHub Copilot — but have almost no visibility into how those tools are actually used. How many tokens are consumed? Which agent is used most? How much does it cost? Where is the time spent?
 
-This system makes that visible. A **collector** reads AI usage data on a schedule, an **API** validates and stores it, and a **dashboard** shows it live. Everything runs locally with one `docker compose up`.
+This system answers those questions with a **local-first observability stack**: a collector reads AI agent telemetry from a developer workstation on a schedule, an ingest API validates and stores it, and a live dashboard visualises it. Everything runs locally with one `docker compose up`.
 
 ---
 
-## 2. Architecture
+## 2. System Architecture
 
 ```
-Developer machine
+Developer Workstation
 │
 ├── AI tools (run normally) → write session files to disk
+│     Claude Code → ~/.claude/projects/
+│     Cursor      → ~/.cursor/ (sqlite)
+│     Codex       → ~/.codex/sessions/
 │
 └── Collector (CodeBurn extension)
-      Runs on a schedule (default 60 min)
-      Reads data from CodeBurn, maps to AgentEvent
-      POSTs a batch to the API (with X-Api-Key)
+      Runs on a configurable interval (default 60 min)
+      Reads data via CodeBurn (already installed in this repo)
+      Maps to the AgentEvent schema
+      POSTs a batch to the Azure Function (Authorization: Bearer JWT)
             │
             ▼
-      Azure Function (C# .NET v4 isolated)
-        POST /events          → validate + store batch
-        GET  /events/summary  → aggregated data for dashboard
-        GET  /health          → database check
+      Azure Function (C# .NET, Functions v4 isolated)
+        POST /auth/token      → exchange API key for a JWT
+        POST /events          → validate + persist batch
+        GET  /events/summary  → aggregate for dashboard
+        GET  /health          → DB connectivity check
             │
             ▼
-      Azure SQL Edge (Docker)  →  AgentEvents table, indexed
+      Azure SQL Edge (Docker)
+        AgentEvents table, indexed on timestamp + agent
             │
             ▼
-      React + TypeScript dashboard  →  polls /events/summary
+      React + TypeScript dashboard
+        Polls /events/summary, renders charts + feed
 ```
 
 ---
 
-## 3. Data Source (based on real CodeBurn output)
+## 3. Data Source — Grounded in Real CodeBurn Output
 
-This was written after running the tool, not from guesses. The collector uses CodeBurn's existing JSON output:
+> This section was written **after running the tool**, not from assumptions. The collector's source of truth is the JSON CodeBurn already produces.
+
+The collector obtains data by invoking CodeBurn's existing JSON output rather than re-parsing session files:
 
 ```
-codeburn export -f json     # primary source (has a real sessions[] list)
-codeburn report --format json
+codeburn report --format json                 # all providers combined
+codeburn report --provider claude --format json
+codeburn report --provider cursor --format json
+codeburn report --provider codex  --format json
 ```
 
-`export -f json` gives a real per-session list. Each session has: `Project`, `Session ID`, `Started At` (real timestamp), `Cost`, `API Calls`, `Turns`. It also gives aggregated arrays: `models[]` (with tokens), `activity[]`, `daily[]`, `projects[]`, `tools[]`.
+A real `report --format json` run on this workstation returns aggregated rollups, not a flat list of fully-detailed events. The top-level shape is:
 
-**What is real per session vs. aggregate (honest note):**
-- Per session: id, start time, cost, API calls, turns, project.
-- Aggregate only: tokens, model, and activity type are reported per *model/period*, not per session.
-- So each event is a session row, enriched (best effort) with the model and activity breakdown from the aggregate arrays. The mapper fills `0`/`null` for any field CodeBurn does not expose at session level.
+| Key | Contains |
+|---|---|
+| `overview` | totals: `cost`, `calls`, `sessions`, `tokens{input,output,cacheRead,cacheWrite}` |
+| `daily[]` | per-day rollups: `date`, `cost`, `calls`, `turns`, `editTurns`, `oneShotRate` |
+| `projects[]` | `name`, `path`, `cost`, `calls`, `sessions`, `avgCostPerSession` |
+| `models[]` | `name`, `calls`, `inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `cost`, `oneShotRate` |
+| `activities[]` | `category`, `cost`, `turns`, `editTurns` |
+| `tools[]` | `name`, `calls` |
+| `topSessions[]` | `project`, `sessionId`, `date`, `cost`, `calls` |
 
-**Event = one session** (real id, timestamp, cost, calls). This keeps the data honest and gives the dashboard a real "recent events" feed. Trade-off is in DESIGN.md (Decision 8).
+### Per-agent attribution mechanism
+CodeBurn's `--provider` flag works on `report`. The collector therefore runs `report` **once per provider** and tags every emitted event with that provider as `agentName`. This gives clean per-agent breakdowns without re-implementing any parsing.
+
+### Honest field-availability note (implementation must verify)
+Not every target field exists at session granularity in the `report` output:
+
+- **Available directly:** agent/provider, cost, calls/apiCalls, token totals (input/output/cache), per-day timeline, activity categories, session ids (from `topSessions`).
+- **Aggregate-only or derived:** per-session token split, per-session activity type, and `sessionDurationMinutes` are not present per-session in `report`. The collector derives session duration from session first/last timestamps where available, and otherwise sends `0` / `null` for fields CodeBurn does not expose at that grain.
+- **Action for implementer:** before finalising the mapper, run `codeburn report --format json` and `codeburn export -f json` and confirm each mapped field against live output. Do not claim a field the tool does not emit.
+
+### Event granularity decision
+The collector uses `codeburn export -f json` as its source; an event = one row from `sessions[]` (real id, timestamp, cost, calls, turns, project). Per-session token/model/activity are enriched from the aggregate `models[]`/`activity[]` arrays. This decision and its trade-off are documented in DESIGN.md (Decision 8).
 
 ---
 
-## 4. Collector
+## 4. Component 1 — Collector
 
-**Purpose:** extend CodeBurn to collect on a schedule and send to the API. No existing CodeBurn file is changed.
+**Purpose:** extend CodeBurn to periodically collect AI agent data and transmit it to the ingest API. No existing CodeBurn source file is modified.
 
-### Config (environment variables)
+### Environment variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `INGEST_ENDPOINT` | Yes | — | API base URL |
-| `COLLECTOR_API_KEY` | Yes | — | Sent as `X-Api-Key` |
+| `INGEST_ENDPOINT` | Yes | — | Azure Function base URL |
+| `COLLECTOR_API_KEY` | Yes | — | Exchanged at `/auth/token` for a JWT bearer token |
 | `COLLECTION_INTERVAL_MINUTES` | No | 60 | How often to collect |
 
 ### Acceptance criteria
 
-**C1 — Scheduled collection works**
+**C1 — Successful scheduled collection**
 ```
-Given the collector runs with interval = 60
-When 60 minutes pass
-Then sessions are collected, mapped, and POSTed as one batch
-And a 201 response is logged with the event count
+Given the collector is running with interval = 60
+When 60 minutes elapse
+Then sessions are collected via CodeBurn for each provider
+And mapped to AgentEvent format
+And sent as a single batch POST to /events
+And HTTP 201 is received
+And success is logged with the event count
 ```
 
-**C2 — Interval is configurable**
+**C2 — Configurable interval**
 ```
 Given COLLECTION_INTERVAL_MINUTES = 2
 When the collector starts
-Then it collects every 2 minutes (default 60 if unset)
+Then collection runs every 2 minutes
+And the default of 60 is used when the variable is unset
 ```
 
-**C3 — Collects once on startup**
+**C3 — Immediate collection on startup**
 ```
-Given the collector starts
-Then one collection runs immediately, then the schedule begins
-```
-
-**C4 — API down does not crash the collector**
-```
-Given the API is not running
-When a POST fails
-Then the error is logged, the process keeps running, and it retries next interval
+Given the collector starts for the first time
+When the process initialises
+Then one collection runs immediately
+And the scheduled interval begins after that first run
 ```
 
-**C5 — Missing config fails fast**
+**C4 — API unavailable does not crash collector**
+```
+Given the Azure Function is not running
+When scheduled collection runs and the POST fails
+Then the network error is caught and logged
+And the collector process keeps running
+And it retries on the next scheduled interval
+```
+
+**C5 — Missing required configuration fails fast**
 ```
 Given INGEST_ENDPOINT is not set
 When the collector starts
-Then it exits immediately and names the missing variable
+Then the process exits immediately
+And the error names the missing variable
 ```
 
-**C6 — Empty collection handled**
+**C6 — Empty collection is handled**
 ```
-Given no AI sessions exist
+Given no AI tool sessions exist on the workstation
 When collection runs
-Then no empty batch is sent, and a "nothing collected" line is logged
+Then no empty batch is sent
+And a log line states that no events were collected
+And the collector continues normally
 ```
 
-**C7 — Manual trigger (assignment requires this)**
+**C7 — Manual trigger (required by assignment)**
 ```
-Given a developer does not want to wait for the schedule
-When they run the documented command (e.g. `npm run collect:once`)
-Then one collection runs and POSTs immediately
+Given a developer wants data without waiting for the schedule
+When they run the documented manual-trigger command
+  (e.g. `npm run collect:once`)
+Then exactly one collection runs and POSTs immediately
+And the scheduled loop is unaffected
 ```
 
 ---
 
-## 5. Ingest API (Azure Function, C# .NET v4 isolated)
+## 5. Component 2 — Ingest API (Azure Function, C# .NET v4 isolated)
 
-### `POST /events`
+### Endpoint — `POST /auth/token`
 
-**Body**
+Exchanges the shared API key for a short-lived JWT. The collector calls this first, caches the token, and reuses it until it expires.
+
+**Request body**
+```json
+{ "apiKey": "<COLLECTOR_API_KEY>" }
+```
+
+**Response**
+```json
+{ "token": "<JWT>", "expiresIn": 86400 }
+```
+
+The token is an HMAC-SHA256 (HS256) JWT with claims `iss` = `observability-api`, `aud` = `collector`, `exp` = issue time + 24h, and `nbf` = issue time. A wrong or missing key returns `401` and no token is issued. The API validates issuer, audience, expiry, and signature on every `POST /events` call before any database write.
+
+### Endpoint 1 — `POST /events`
+
+**Request body**
 ```json
 {
   "events": [
@@ -150,7 +206,7 @@ Then one collection runs and POSTs immediately
       "apiCalls": 52,
       "hasAgentSpawn": false,
       "sessionDurationMinutes": 0,
-      "eventTimestamp": "2026-06-19T18:08:56Z",
+      "eventTimestamp": "2026-06-19T00:00:00Z",
       "collectedAt": "2026-06-23T10:39:33Z"
     }
   ],
@@ -160,41 +216,63 @@ Then one collection runs and POSTs immediately
 
 **C8 — Valid batch accepted**
 ```
-Given a valid batch of 5 events with the correct API key
+Given a valid batch of 5 events with a valid bearer token
 When POST /events is called
 Then all 5 are saved in one transaction
-And 201 is returned with { "stored": 5 }
+And 201 is returned with { "stored": 5, "message": "..." }
 ```
 
-**C9 — Auth required**
+**C9 — Authentication required**
 ```
-Given no X-Api-Key header
+Given a request with no valid Authorization: Bearer token
 When POST /events is called
-Then 401 is returned, nothing is written, the attempt is logged
+Then 401 is returned
+And no database write is attempted
+And the rejected attempt is logged
 ```
 
-**C10 — Empty batch rejected** → `400 "Batch cannot be empty"`
-
-**C11 — Oversized batch rejected** → `400 "Batch cannot exceed 1000 events"`
-
-**C12 — Bad event rejected (all-or-nothing)**
+**C10 — Empty batch rejected**
 ```
-Given one event missing agentName
-Then 400 names the missing field and nothing is saved
+Given an empty events array
+When POST /events is called
+Then 400 is returned with "Batch cannot be empty"
 ```
 
-**C13 — Malformed JSON rejected safely** → `400`, no internal details leaked
-
-**C14 — Database failure handled safely**
+**C11 — Oversized batch rejected**
 ```
-Given the database is down
-Then 503 is returned, details logged internally only,
-  caller sees "Service temporarily unavailable"
+Given a batch of 1001 events
+When POST /events is called
+Then 400 is returned with "Batch cannot exceed 1000 events"
 ```
 
-### `GET /events/summary`
+**C12 — Invalid event rejected atomically**
+```
+Given one event in the batch has a missing agentName
+When POST /events is called
+Then 400 is returned naming the missing field
+And no events are saved (all-or-nothing)
+```
 
-**Query:** `timeRange` = `1h` | `6h` | `24h` | `7d` (default `24h`).
+**C13 — Malformed JSON rejected safely**
+```
+Given a malformed JSON body
+When POST /events is called
+Then 400 is returned
+And no internal error details are exposed
+```
+
+**C14 — Database failure surfaced safely**
+```
+Given the database is unreachable
+When POST /events is called
+Then 503 is returned
+And full details are logged internally only
+And the caller sees "Service temporarily unavailable"
+```
+
+### Endpoint 2 — `GET /events/summary`
+
+**Query:** `timeRange` ∈ {`1h`,`6h`,`24h`,`7d`}, default `24h`.
 
 **Response**
 ```json
@@ -205,32 +283,59 @@ Then 503 is returned, details logged internally only,
   "totalCostUsd": 2.8431,
   "totalTokens": 1842930,
   "averageSessionDurationMinutes": 34,
-  "byAgent": [ { "agentName": "Cursor", "eventCount": 89, "totalCostUsd": 1.92, "totalTokens": 1204830 } ],
+  "byAgent": [
+    { "agentName": "Cursor", "eventCount": 89, "totalCostUsd": 1.9231, "totalTokens": 1204830 }
+  ],
   "byActivity": [ { "activityType": "coding", "count": 67 } ],
-  "timeline": [ { "hour": "2026-06-23T09:00:00Z", "count": 12, "totalCost": 0.23 } ],
+  "timeline": [ { "hour": "2026-06-23T09:00:00Z", "count": 12, "totalCost": 0.2341 } ],
   "recentEvents": []
 }
 ```
 
 **C15 — Valid range returns aggregates**
 ```
-Given 142 events in the last 24h
-Then totalEvents = 142, byAgent covers all agents,
-  timeline has hourly buckets, recentEvents has the last 20
+Given 142 events exist in the last 24 hours
+When GET /events/summary?timeRange=24h is called
+Then totalEvents = 142
+And byAgent covers all active agents
+And timeline has hourly buckets
+And recentEvents has the last 20 events
+And averageSessionDurationMinutes is returned
 ```
 
-**C16 — Invalid range rejected** → `400` listing valid options
+**C16 — Invalid range rejected**
+```
+Given timeRange=99h
+When GET /events/summary is called
+Then 400 is returned listing valid options
+```
 
-**C17 — Empty database returns zeros (not 404)** → `200` with zero counts and empty arrays
+**C17 — Empty database returns zeros, not 404**
+```
+Given no events exist
+When GET /events/summary is called
+Then 200 is returned with zero counts and empty arrays
+```
 
-### `GET /health`
+### Endpoint 3 — `GET /health`
 
-**C18 — Healthy** → `200 { status: "healthy", database: "connected" }`
-**C19 — Unhealthy** → `503 { status: "unhealthy", database: "unreachable" }`
+**C18 — Healthy**
+```
+Given the database is connected
+When GET /health is called
+Then 200 with { status: "healthy", database: "connected" }
+```
+
+**C19 — Unhealthy**
+```
+Given the database container is stopped
+When GET /health is called
+Then 503 with { status: "unhealthy", database: "unreachable" }
+```
 
 ---
 
-## 6. Database (Azure SQL Edge)
+## 6. Component 3 — Database (Azure SQL Edge)
 
 ```sql
 CREATE TABLE AgentEvents (
@@ -254,78 +359,128 @@ CREATE TABLE AgentEvents (
   CONSTRAINT UQ_AgentEvents UNIQUE (SessionId, EventTimestamp, AgentName)
 );
 
-CREATE INDEX IX_AgentEvents_EventTimestamp      ON AgentEvents(EventTimestamp DESC);
-CREATE INDEX IX_AgentEvents_AgentName_Timestamp ON AgentEvents(AgentName, EventTimestamp DESC);
-CREATE INDEX IX_AgentEvents_ActivityType        ON AgentEvents(ActivityType, EventTimestamp DESC);
+CREATE INDEX IX_AgentEvents_EventTimestamp
+  ON AgentEvents(EventTimestamp DESC);
+CREATE INDEX IX_AgentEvents_AgentName_Timestamp
+  ON AgentEvents(AgentName, EventTimestamp DESC);
+CREATE INDEX IX_AgentEvents_ActivityType
+  ON AgentEvents(ActivityType, EventTimestamp DESC);
 ```
 
-The unique constraint makes resent batches safe: a retry rejects duplicate sessions instead of double-counting them.
+> The `UQ_AgentEvents` unique constraint makes re-sent batches idempotent: if the collector retries after a partial failure, duplicate sessions are rejected rather than double-counted.
 
-**C20 — Time-range query is fast** → uses the timestamp index, returns quickly even with thousands of rows.
+**C20 — Time-range query is fast**
+```
+Given 10,000 events across 30 days
+When querying the last 24 hours
+Then the IX_AgentEvents_EventTimestamp index is used
+And the query returns in under 500 ms
+```
 
-**C21 — Schema sets up on first run** → `init.sql` creates the table + indexes, `seed.sql` adds sample data.
-
----
-
-## 7. Dashboard (React + TypeScript)
-
-**C22 — Loads with data** → total card, by-agent chart, timeline chart, and recent-events feed all render; header shows last-updated time.
-
-**C23 — Time-range buttons** → clicking `7d` updates every component and calls the API with `timeRange=7d`, no page reload.
-
-**C24 — API down** → an error banner shows, last known data stays visible, nothing crashes.
-
-**C25 — Empty state** → a "No data yet" message with a hint to run a manual collection.
-
-**C26 — Auto refresh** → polls `/events/summary` every 60s and updates the last-updated time.
+**C21 — Schema initialises on first run**
+```
+Given a fresh Docker environment
+When docker compose up runs
+Then init.sql creates the table and indexes
+And seed.sql inserts sample data
+```
 
 ---
 
-## 8. Traceability (spec → code → check)
+## 7. Component 4 — Dashboard (React + TypeScript)
 
-Each acceptance criterion is traceable to the part that implements it and how it is checked. Tests are written **after** implementation to confirm the spec — not test-first. (The team confirmed in interview they do not use TDD; see DESIGN.md Decision 10.)
+**C22 — Initial load with data**
+```
+Given events exist
+When the dashboard opens
+Then loading skeletons show briefly
+And the total card, by-agent chart, timeline chart,
+   and recent-events feed all render correctly
+And the header shows a last-updated timestamp
+```
 
-| Criteria | Component | How it's checked |
+**C23 — Time-range selection**
+```
+Given the dashboard shows 24h
+When the user clicks 7d
+Then all components update together
+And the API is called with timeRange=7d
+And no full page reload occurs
+```
+
+**C24 — API unavailable**
+```
+Given the Azure Function is down
+When the dashboard loads or polls
+Then an error banner appears
+And the last known data stays visible if available
+And the dashboard does not crash or blank out
+```
+
+**C25 — Empty state**
+```
+Given no events exist
+When the dashboard loads
+Then a "No data yet" state shows
+And a hint explains how to trigger a manual collection
+```
+
+**C26 — Automatic polling**
+```
+Given the dashboard is open
+When 60 seconds elapse
+Then GET /events/summary is called automatically
+And the last-updated timestamp refreshes
+```
+
+---
+
+## 8. Traceability Matrix
+
+> The role explicitly values "strong traceability between specifications, code, and tests." Each criterion maps to a test before it is built.
+
+| Criterion | Component | Test (planned) |
 |---|---|---|
-| C1, C3, C6, C7 | Collector | Run with a 2-min interval and watch logs |
-| C2, C5 | Collector | Start with/without env vars |
-| C4 | Collector | Stop the API, confirm it keeps running |
-| C8–C14 | API | Call endpoints via REST client / Swagger |
-| C15–C17 | API | Query summary with valid/invalid ranges |
-| C18, C19 | API | Hit /health with DB up and down |
-| C20, C21 | Database | `docker compose up` smoke check |
-| C22–C26 | Dashboard | Open in browser, toggle ranges, stop API |
-
-A small set of automated tests covers the highest-value paths (batch validation, auth, summary aggregation).
+| C1, C3, C6 | Collector | `scheduler.test.ts` |
+| C2, C5, C7 | Collector | `config.test.ts` |
+| C4 | Collector | `eventSender.test.ts` |
+| C8, C10–C13 | API | `IngestEventsTests` |
+| C9 | API | `AuthTests` |
+| C14, C20 | API/DB | `EventRepositoryTests` |
+| C15–C17 | API | `SummaryTests` |
+| C18, C19 | API | `HealthTests` |
+| C21 | DB | `docker compose up` smoke test |
+| C22–C26 | Dashboard | `dashboard.test.tsx` |
 
 ---
 
-## 9. Non-Functional Targets
+## 9. Non-Functional Requirements
 
-| Target | Goal |
+| Requirement | Target |
 |---|---|
 | `docker compose up` to ready | under 60 s |
 | `POST /events` (100 events) | under 500 ms |
 | `GET /events/summary` | under 200 ms |
-| Dashboard first load | under 3 s |
+| Dashboard initial load | under 3 s |
+| Collector memory | under 100 MB |
 | Collector with 0 sessions | no crash; log and continue |
 
 ---
 
-## 10. Security
+## 10. Security Requirements
 
-- `POST /events` needs the `X-Api-Key` header.
-- Secrets only in environment variables — never in code or git.
-- Database not exposed outside the Docker network.
-- All SQL uses parameters — no string building.
-- Dashboard has no login (local only) — accepted limitation.
+- `POST /events` requires a JWT bearer token (`Authorization: Bearer`), obtained by exchanging `COLLECTOR_API_KEY` at `POST /auth/token`.
+- Secrets live in environment variables only — never in code or git history.
+- The database is not exposed outside the Docker network.
+- All SQL uses parameters — no string concatenation.
+- Dashboard has no auth (local only); this is a stated, accepted limitation.
 
 ---
 
 ## 11. Out of Scope
 
-- Real-time streaming
-- Multi-machine aggregation
-- Dashboard login
-- Cloud deployment (local only, unless done as bonus)
-- Backfill of sessions from before install
+- Real-time event streaming
+- Multi-machine aggregation (single workstation only)
+- Dashboard authentication
+- Cloud deployment (local only, unless attempted as bonus)
+- Backfill of sessions from before the collector was installed
